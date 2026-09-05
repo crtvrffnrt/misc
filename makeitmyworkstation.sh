@@ -14,8 +14,8 @@ Usage: bash makeitmyworkstation.sh
        bash makeitmyworkstation.sh -h
 
 With no arguments, installs the complete workstation. The only option is -h.
-The script must be executed as root and requires an existing Kali repository.
-Supported: 64-bit Kali/Debian/Ubuntu/Raspberry Pi OS, amd64 and arm64.
+The script must be executed as root. It securely configures Kali Rolling first.
+Supported: 64-bit Kali, Debian, and Raspberry Pi OS; amd64 and arm64.
 It installs large Kali tool and wordlist collections, Docker, current Python,
 Go and Rust, all ProjectDiscovery tools, and history-derived CLI tools.
 Install failures are retried up to three times with repair steps and reported.
@@ -38,29 +38,14 @@ parse_args() {
     die 'The only supported option is -h. Run without arguments to install.'
 }
 
-check_kali_repository() {
-    local files=() file
-    [[ -f /etc/apt/sources.list ]] && files+=(/etc/apt/sources.list)
-    while IFS= read -r -d '' file; do files+=("$file"); done < <(
-        find /etc/apt/sources.list.d -maxdepth 1 -type f \
-            \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null
-    )
-    ((${#files[@]})) || die 'No APT source files found; an existing Kali repository is required'
-    awk '
-        /^[[:space:]]*#/ { next }
-        /^[[:space:]]*(deb|URIs:|Suites:)/ &&
-            ($0 ~ /kali\.org\/kali/ || $0 ~ /kali-rolling/) { found=1 }
-        END { exit !found }
-    ' "${files[@]}" || die 'No enabled Kali repository found in /etc/apt/sources.list or /etc/apt/sources.list.d'
-}
-
 detect_platform() {
     [[ -r /etc/os-release ]] || die 'Missing /etc/os-release'
     # shellcheck disable=SC1091
     source /etc/os-release
     case "${ID:-}" in
-        kali|debian|ubuntu|raspbian) ;;
-        *) die "Unsupported distribution: ${ID:-unknown}" ;;
+        kali|debian|raspbian) ;;
+        ubuntu) die 'Ubuntu is not supported: mixing Kali and Ubuntu repositories is unsafe' ;;
+        *) die "Unsupported distribution: ${ID:-unknown}; use Kali, Debian, or Raspberry Pi OS" ;;
     esac
     ARCH=$(dpkg --print-architecture)
     case "$ARCH" in
@@ -69,7 +54,6 @@ detect_platform() {
         *) die "Unsupported architecture $ARCH. Use a 64-bit OS on Raspberry Pi." ;;
     esac
     ((EUID == 0)) || die 'This script must be executed as root'
-    check_kali_repository
     HOME=/root
     BASE="$HOME/.local/share/cyber-workstation"
     BIN="$BASE/bin"
@@ -81,6 +65,55 @@ detect_platform() {
     if command -v nproc >/dev/null; then JOBS=$(nproc); ((JOBS > 4)) && JOBS=4; fi
     export GOMAXPROCS="$JOBS" CARGO_BUILD_JOBS="$JOBS"
     export PATH="$BIN:$BASE/go/current/bin:$CARGO_HOME/bin:$BASE/pdtm:$PATH"
+}
+
+configure_kali_repository() {
+    note 'Configure the official Kali Rolling repository and archive keyring'
+    local key_url='https://archive.kali.org/archive-keyring.gpg'
+    local keyring='/usr/share/keyrings/kali-archive-keyring.gpg'
+    local source_file='/etc/apt/sources.list.d/kali.sources'
+    local expected_fingerprint='827C8569F2518CC677FECA1AED65462EC8D5E4C5'
+    local downloaded_key="$RUN/kali-archive-keyring.gpg"
+    local staged_source="$RUN/kali.sources"
+
+    # Fresh Debian needs these before it can authenticate and use Kali metadata.
+    if ! command -v curl >/dev/null || ! command -v gpg >/dev/null ||
+        ! dpkg-query -W -f='${Status}' ca-certificates 2>/dev/null | grep -Fq 'install ok installed'; then
+        retry 'Refresh the original distribution repositories' apt-get update -o Acquire::Retries=3 || \
+            die 'Could not refresh the original repositories to install repository prerequisites'
+        apt_install ca-certificates curl gnupg || \
+            die 'Could not install ca-certificates, curl, and gnupg'
+    fi
+    fetch "$key_url" "$downloaded_key"
+    gpg --batch --quiet --show-keys --with-colons "$downloaded_key" 2>/dev/null |
+        awk -F: '$1 == "fpr" { print $10 }' |
+        grep -Fxq "$expected_fingerprint" || \
+        die 'Downloaded Kali archive key does not contain the expected official fingerprint'
+    install -d -m 0755 /usr/share/keyrings /etc/apt/sources.list.d
+    install -m 0644 "$downloaded_key" "$keyring.new"
+    mv -f "$keyring.new" "$keyring"
+
+    cat > "$staged_source" <<'EOF'
+# See https://www.kali.org/docs/general-use/kali-apt-sources/
+Types: deb
+URIs: http://http.kali.org/kali/
+Suites: kali-rolling
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/kali-archive-keyring.gpg
+EOF
+    if [[ -f $source_file ]] && ! cmp -s "$staged_source" "$source_file"; then
+        cp -p "$source_file" "$RUN/kali.sources.before"
+    fi
+    install -m 0644 "$staged_source" "$source_file.new"
+    mv -f "$source_file.new" "$source_file"
+
+    if ! grep -Fxq 'URIs: http://http.kali.org/kali/' "$source_file" ||
+        ! grep -Fxq 'Suites: kali-rolling' "$source_file" ||
+        ! grep -Fxq 'Signed-By: /usr/share/keyrings/kali-archive-keyring.gpg' "$source_file"; then
+        die 'Kali repository file verification failed'
+    fi
+    retry 'Verify signed Kali Rolling metadata' apt-get update -o Acquire::Retries=3 || \
+        die 'Kali repository metadata could not be authenticated and downloaded'
 }
 
 package_plan() {
@@ -346,6 +379,7 @@ main() {
     exec > >(tee -a "$RUN/install.log") 2>&1
     trap on_error ERR
     note 'Installation begins'
+    configure_kali_repository
     install_packages
     install_command_aliases
     retry 'Install current Python runtimes' install_python || FAILURES+=(python-runtime)
