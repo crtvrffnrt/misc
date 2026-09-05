@@ -64,7 +64,18 @@ detect_platform() {
     export GOPATH="$BASE/gopath" GOBIN="$BIN"
     if command -v nproc >/dev/null; then JOBS=$(nproc); ((JOBS > 4)) && JOBS=4; fi
     export GOMAXPROCS="$JOBS" CARGO_BUILD_JOBS="$JOBS"
-    export PATH="$BIN:$BASE/go/current/bin:$CARGO_HOME/bin:$BASE/pdtm:$PATH"
+    export PATH="$BIN:$BASE/go/current/bin:$CARGO_HOME/bin:$BASE/pdtm:$BASE/npm/bin:$PATH"
+}
+
+check_disk_space() {
+    local available_kib required_kib=$((20 * 1024 * 1024))
+    available_kib=$(df -Pk / | awk 'NR == 2 { print $4 }')
+    [[ $available_kib =~ ^[0-9]+$ ]] || die 'Could not determine free disk space'
+    if dpkg-query -W -f='${db:Status-Abbrev}' kali-tools-top10 2>/dev/null | grep -Fqx 'ii '; then
+        required_kib=$((2 * 1024 * 1024))
+    fi
+    ((available_kib >= required_kib)) || \
+        die "Insufficient disk space: $((required_kib / 1024 / 1024)) GiB free is required"
 }
 
 configure_kali_repository() {
@@ -107,6 +118,13 @@ EOF
     install -m 0644 "$staged_source" "$source_file.new"
     mv -f "$source_file.new" "$source_file"
 
+    # APT does not support mixing a Debian base with Kali Rolling. Once the
+    # requested conversion starts, preserve and disable Debian OS sources while
+    # leaving unrelated vendor repositories available.
+    if [[ $ID != kali ]]; then
+        disable_native_distribution_sources "$source_file"
+    fi
+
     if ! grep -Fxq 'URIs: http://http.kali.org/kali/' "$source_file" ||
         ! grep -Fxq 'Suites: kali-rolling' "$source_file" ||
         ! grep -Fxq 'Signed-By: /usr/share/keyrings/kali-archive-keyring.gpg' "$source_file"; then
@@ -116,12 +134,33 @@ EOF
         die 'Kali repository metadata could not be authenticated and downloaded'
 }
 
+disable_native_distribution_sources() {
+    local kali_source=$1 file destination
+    local disabled_dir='/etc/apt/sources.list.d/disabled-by-makeitmyworkstation'
+    local files=()
+    [[ -f /etc/apt/sources.list ]] && files+=(/etc/apt/sources.list)
+    while IFS= read -r -d '' file; do files+=("$file"); done < <(
+        find /etc/apt/sources.list.d -maxdepth 1 -type f \
+            \( -name '*.list' -o -name '*.sources' \) -print0 2>/dev/null
+    )
+    install -d -m 0755 "$disabled_dir" "$RUN/native-sources-before"
+    for file in "${files[@]}"; do
+        [[ $file == "$kali_source" ]] && continue
+        if grep -Eq 'debian-archive-keyring|raspbian-archive-keyring|(^|[/:.])debian([^[:alpha:]]|$)|raspbian' "$file"; then
+            destination="$disabled_dir/$(basename "$file").disabled"
+            cp -p "$file" "$RUN/native-sources-before/$(basename "$file")"
+            mv -f "$file" "$destination"
+            printf 'Disabled conflicting native repository: %s (saved as %s)\n' "$file" "$destination"
+        fi
+    done
+}
+
 package_plan() {
     REQUIRED=(ca-certificates curl wget git gnupg jq unzip zip xz-utils
         build-essential pkg-config libssl-dev libffi-dev libpcap-dev
         python3 python3-venv python3-dev zsh bash-completion util-linux
-        nmap hashcat docker.io nodejs npm)
-    OPTIONAL=(kali-linux-headless kali-tools-top10 kali-tools-information-gathering
+        nmap hashcat docker.io docker-cli nodejs npm)
+    OPTIONAL=(kali-tools-top10 kali-tools-information-gathering
         kali-tools-vulnerability kali-tools-web kali-tools-database
         kali-tools-passwords kali-tools-exploitation kali-tools-post-exploitation
         kali-tools-forensics kali-tools-reverse-engineering kali-tools-sniffing-spoofing
@@ -130,9 +169,9 @@ package_plan() {
         git-lfs ripgrep fd-find bat fzf tmux htop tree nano vim
         silversearcher-ag shellcheck bats pipx ruby ruby-dev perl php-cli
         clang cmake make libclang-dev libkrb5-dev krb5-user
-        dnsutils whois traceroute iputils-ping iproute2 net-tools
+        bind9-dnsutils whois traceroute iputils-ping iproute2 net-tools
         netcat-openbsd socat openssh-client openvpn tcpdump tshark
-        sqlite3 libxml2-utils xmlstarlet file libimage-exiftool-perl p7zip-full
+        sqlite3 libxml2-utils xmlstarlet file libimage-exiftool-perl 7zip
         plocate pciutils
         lsof strace gdb dnsrecon sslscan whatweb ffuf gobuster
         john hashcat-data clinfo azure-cli
@@ -155,8 +194,9 @@ retry() {
     shift
     for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
         note "$label (attempt $attempt/$MAX_ATTEMPTS)"
-        if (set -Ee; "$@"); then return 0; fi
-        rc=$?
+        rc=0
+        (set -Ee; "$@") || rc=$?
+        ((rc == 0)) && return 0
         printf 'Attempt %d for %s failed with exit %d.\n' "$attempt" "$label" "$rc" >&2
         ((attempt < MAX_ATTEMPTS)) && sleep $((attempt * 2))
     done
@@ -172,17 +212,25 @@ candidate() {
 apt_install() {
     local attempt rc
     for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
-        if env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
+        rc=0
+        env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l \
             apt-get -y --no-remove --no-install-recommends \
-            -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120 install "$@"; then
+            -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120 \
+            -o Binary::apt::APT::Keep-Downloaded-Packages=false install "$@" || rc=$?
+        if ((rc == 0)); then
+            apt-get clean
             return 0
         fi
-        rc=$?
         printf 'APT install failed (attempt %d/%d, exit %d); running repair steps.\n' \
             "$attempt" "$MAX_ATTEMPTS" "$rc" >&2
         dpkg --configure -a || true
-        env DEBIAN_FRONTEND=noninteractive apt-get -f install -y \
-            -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120 || true
+        if ! env DEBIAN_FRONTEND=noninteractive apt-get -f install -y \
+            -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120; then
+            printf 'Normal dependency repair failed; retrying once with dpkg file-overwrite recovery.\n' >&2
+            env DEBIAN_FRONTEND=noninteractive apt-get -f install -y \
+                -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120 \
+                -o Dpkg::Options::=--force-overwrite || true
+        fi
         apt-get update -o Acquire::Retries=3 || true
     done
     return "$rc"
@@ -195,18 +243,27 @@ install_packages() {
     retry 'Refresh APT metadata' apt-get update -o Acquire::Retries=3 || \
         die 'APT metadata refresh failed after repair attempts'
     local p
+    local available_optional=()
     for p in "${REQUIRED[@]}"; do
         candidate "$p" || die "Required APT package unavailable: $p"
     done
     apt_install "${REQUIRED[@]}"
-    # Independent transactions prevent a single unavailable tool from blocking others.
+    # Resolve the full tool plan once. This is much faster than asking APT to
+    # recalculate a large Kali dependency graph for every package.
     for p in "${OPTIONAL[@]}"; do
         if candidate "$p"; then
-            if ! apt_install "$p"; then FAILURES+=("apt:$p"); fi
+            available_optional+=("$p")
         else
             MISSING+=("apt:$p")
         fi
     done
+    if ((${#available_optional[@]})) && ! apt_install "${available_optional[@]}"; then
+        printf 'Combined optional install failed; isolating failed packages individually.\n' >&2
+        for p in "${available_optional[@]}"; do
+            dpkg-query -W -f='${db:Status-Abbrev}' "$p" 2>/dev/null | grep -Fqx 'ii ' || \
+                apt_install "$p" || FAILURES+=("apt:$p")
+        done
+    fi
     if candidate docker-compose-v2; then
         apt_install docker-compose-v2 || FAILURES+=(docker-compose-v2)
     elif candidate docker-compose; then
@@ -372,6 +429,7 @@ main() {
     package_plan
     note "Installing complete workstation on ${PRETTY_NAME:-$ID} / $ARCH"
     printf 'This includes large Kali tool and wordlist collections.\n'
+    check_disk_space
     mkdir -p "$BASE" "$BIN" "$BASE/pdtm" "$BASE/runs"
     exec 9> "$BASE/bootstrap.lock"
     flock -n 9 || die 'Another bootstrap for this account is running'
